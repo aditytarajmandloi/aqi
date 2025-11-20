@@ -1,0 +1,334 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AQI Visualizer | Smog Canvas</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;600;800&display=swap" rel="stylesheet">
+    
+    <style>
+        :root { --glass: rgba(20, 20, 20, 0.75); --text: #fff; }
+        
+        body { margin: 0; overflow: hidden; font-family: 'Inter', sans-serif; background: #111; }
+
+        /* Full Screen Map */
+        #map { height: 100vh; width: 100vw; z-index: 1; }
+
+        /* Floating UI Container */
+        .ui-layer {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            z-index: 1000;
+            width: 350px;
+            max-width: 90vw;
+            display: flex;
+            flex-direction: column;
+            gap: 15px;
+        }
+
+        /* Glassmorphism Card Style */
+        .glass-card {
+            background: var(--glass);
+            backdrop-filter: blur(12px);
+            -webkit-backdrop-filter: blur(12px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 16px;
+            padding: 20px;
+            color: var(--text);
+            box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.37);
+            transition: all 0.3s ease;
+        }
+
+        /* Search Bar */
+        .search-box { display: flex; gap: 10px; }
+        input {
+            flex: 1;
+            background: rgba(255, 255, 255, 0.1);
+            border: none;
+            padding: 12px;
+            border-radius: 8px;
+            color: white;
+            outline: none;
+        }
+        button {
+            background: #3b82f6;
+            color: white;
+            border: none;
+            padding: 0 20px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-weight: 600;
+        }
+        button:hover { background: #2563eb; }
+
+        /* Dashboard & Canvas */
+        .dashboard { position: relative; overflow: hidden; text-align: center; }
+        
+        /* The Canvas sits BEHIND the text inside the card */
+        #particleCanvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            z-index: 0; /* Behind text */
+            opacity: 0.6;
+            pointer-events: none;
+        }
+
+        .data-content { position: relative; z-index: 1; /* Above canvas */ }
+
+        .city-title { font-size: 1.1rem; opacity: 0.8; margin-bottom: 5px; }
+        .aqi-big { font-size: 5rem; font-weight: 800; line-height: 1; margin: 10px 0; text-shadow: 0 0 20px rgba(0,0,0,0.5); }
+        .status-badge { 
+            display: inline-block; 
+            padding: 5px 15px; 
+            border-radius: 20px; 
+            font-size: 0.9rem; 
+            font-weight: 600; 
+            background: rgba(255,255,255,0.2);
+        }
+        .details {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 10px;
+            margin-top: 20px;
+            font-size: 0.8rem;
+            text-align: left;
+        }
+        .detail-item { background: rgba(255,255,255,0.05); padding: 10px; border-radius: 8px; }
+        .detail-label { color: #aaa; display: block; margin-bottom: 3px; }
+
+        /* Loading Spinner */
+        .loader {
+            width: 20px; height: 20px; border: 3px solid #fff; border-bottom-color: transparent;
+            border-radius: 50%; display: none; animation: rot 1s linear infinite; margin: 0 auto;
+        }
+        @keyframes rot { 100% { transform: rotate(360deg); } }
+    </style>
+</head>
+<body>
+
+    <div id="map"></div>
+
+    <div class="ui-layer">
+        <div class="glass-card search-box">
+            <input type="text" id="cityInput" placeholder="Enter City (e.g. Mumbai, Paris)..." onkeypress="if(event.key==='Enter') handleSearch()">
+            <button onclick="handleSearch()">Go</button>
+        </div>
+
+        <div class="glass-card dashboard" id="dashboard">
+            <canvas id="particleCanvas"></canvas>
+            
+            <div class="data-content">
+                <div class="loader" id="loader"></div>
+                <div id="contentArea">
+                    <div class="city-title" id="cityName">Start by searching a city</div>
+                    <div class="aqi-big" id="aqiVal">--</div>
+                    <div class="status-badge" id="aqiStatus">No Data</div>
+                    
+                    <div class="details">
+                        <div class="detail-item">
+                            <span class="detail-label">Dominant Pollutant</span>
+                            <strong id="pollutant">--</strong>
+                        </div>
+                        <div class="detail-item">
+                            <span class="detail-label">Temperature</span>
+                            <strong id="temp">--</strong>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script>
+        // ==========================================
+        // 🔑 ENTER YOUR TOKEN HERE
+        // ==========================================
+        const API_TOKEN = '1f735e69461831e61497b6a1bc34e4e8f5007163'; 
+        // ==========================================
+
+        let map;
+        let particleAnimation;
+
+        // 1. Initialize Map
+        function initMap() {
+            map = L.map('map', { zoomControl: false }).setView([20, 0], 2);
+            
+            // Using a Dark Matter map style for better contrast with data
+            L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+                attribution: '&copy; OpenStreetMap &copy; CARTO',
+                subdomains: 'abcd',
+                maxZoom: 19
+            }).addTo(map);
+
+            // Add WAQI Heatmap Overlay
+            L.tileLayer(`https://tiles.waqi.info/tiles/usepa-aqi/{z}/{x}/{y}.png?token=${API_TOKEN}`, {
+                opacity: 0.6
+            }).addTo(map);
+        }
+
+        // 2. Search Logic (Improved)
+        async function handleSearch() {
+            const input = document.getElementById('cityInput').value;
+            if (!input) return;
+            if (API_TOKEN === 'YOUR_API_TOKEN_HERE') {
+                alert("Please edit the code and add your API Token first!");
+                return;
+            }
+
+            toggleLoader(true);
+
+            try {
+                // Step A: Search to get the Station ID (UID)
+                // This fixes the "Search not working" issue by finding the closest match
+                const searchRes = await fetch(`https://api.waqi.info/search/?token=${API_TOKEN}&keyword=${input}`);
+                const searchData = await searchRes.json();
+
+                if (searchData.status === 'ok' && searchData.data.length > 0) {
+                    const bestMatch = searchData.data[0]; // Take the first result
+                    const uid = bestMatch.uid;
+
+                    // Step B: Get detailed feed using UID
+                    const feedRes = await fetch(`https://api.waqi.info/feed/@${uid}/?token=${API_TOKEN}`);
+                    const feedData = await feedRes.json();
+
+                    if (feedData.status === 'ok') {
+                        updateUI(feedData.data);
+                    }
+                } else {
+                    alert("City not found. Try a different name.");
+                }
+            } catch (e) {
+                console.error(e);
+                alert("Connection error.");
+            } finally {
+                toggleLoader(false);
+            }
+        }
+
+        // 3. Update UI Elements
+        function updateUI(data) {
+            const aqi = data.aqi;
+            
+            // Update Text
+            document.getElementById('cityName').innerText = data.city.name;
+            document.getElementById('aqiVal').innerText = aqi;
+            
+            // Pollutant & Temp
+            const dominent = data.dominentpol || 'pm25';
+            const temp = data.iaqi.t ? data.iaqi.t.v + "°C" : "N/A";
+            document.getElementById('pollutant').innerText = dominent.toUpperCase();
+            document.getElementById('temp').innerText = temp;
+
+            // Map Flyto
+            if (data.city.geo) {
+                map.flyTo(data.city.geo, 11, { duration: 2 });
+            }
+
+            // Determine Status & Color
+            let status = "Good";
+            let color = "#00e400";
+            
+            if (aqi > 300) { status = "Hazardous"; color = "#7e0023"; }
+            else if (aqi > 200) { status = "Very Unhealthy"; color = "#8f3f97"; }
+            else if (aqi > 150) { status = "Unhealthy"; color = "#ff0000"; }
+            else if (aqi > 100) { status = "Sensitive Groups"; color = "#ff7e00"; }
+            else if (aqi > 50) { status = "Moderate"; color = "#ffff00"; }
+
+            const statusBadge = document.getElementById('aqiStatus');
+            statusBadge.innerText = status;
+            statusBadge.style.backgroundColor = color;
+            statusBadge.style.color = (aqi > 50 && aqi <= 100) ? '#000' : '#fff'; // Black text for yellow
+
+            // 4. Trigger Canvas Smog Animation
+            startCanvasParticles(aqi, color);
+        }
+
+        function toggleLoader(show) {
+            document.getElementById('loader').style.display = show ? 'block' : 'none';
+            document.getElementById('contentArea').style.opacity = show ? '0' : '1';
+        }
+
+        // ==========================================
+        // 🎨 UNIQUE FEATURE: CANVAS SMOG SIMULATOR
+        // ==========================================
+        function startCanvasParticles(aqi, colorCode) {
+            const canvas = document.getElementById('particleCanvas');
+            const ctx = canvas.getContext('2d');
+            
+            // Resize canvas to match container
+            const rect = canvas.parentElement.getBoundingClientRect();
+            canvas.width = rect.width;
+            canvas.height = rect.height;
+
+            // Cancel previous loop
+            if (particleAnimation) cancelAnimationFrame(particleAnimation);
+
+            // Particle Settings based on AQI
+            // Higher AQI = More particles, darker color, faster movement
+            let particleCount = 30; 
+            let speedFactor = 0.5;
+            let opacity = 0.2;
+            
+            if (aqi > 50) { particleCount = 60; speedFactor = 0.8; opacity = 0.3; }
+            if (aqi > 100) { particleCount = 100; speedFactor = 1.2; opacity = 0.4; }
+            if (aqi > 200) { particleCount = 200; speedFactor = 2.0; opacity = 0.6; }
+
+            const particles = [];
+
+            class Particle {
+                constructor() {
+                    this.x = Math.random() * canvas.width;
+                    this.y = Math.random() * canvas.height;
+                    this.size = Math.random() * 3 + 1;
+                    this.speedX = (Math.random() - 0.5) * speedFactor;
+                    this.speedY = (Math.random() - 0.5) * speedFactor;
+                }
+                update() {
+                    this.x += this.speedX;
+                    this.y += this.speedY;
+                    // Wrap around edges
+                    if (this.x > canvas.width) this.x = 0;
+                    if (this.x < 0) this.x = canvas.width;
+                    if (this.y > canvas.height) this.y = 0;
+                    if (this.y < 0) this.y = canvas.height;
+                }
+                draw() {
+                    ctx.fillStyle = colorCode; // Use AQI color
+                    ctx.globalAlpha = opacity;
+                    ctx.beginPath();
+                    ctx.arc(this.x, this.y, this.size, 0, Math.PI * 2);
+                    ctx.fill();
+                }
+            }
+
+            // Init Particles
+            for (let i = 0; i < particleCount; i++) {
+                particles.push(new Particle());
+            }
+
+            // Animation Loop
+            function animate() {
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+                particles.forEach(p => {
+                    p.update();
+                    p.draw();
+                });
+                particleAnimation = requestAnimationFrame(animate);
+            }
+            animate();
+        }
+
+        // Start
+        initMap();
+        
+        // Optional: Load a default city on start (London) if you have a token
+        // handleSearch('London'); 
+    </script>
+</body>
+</html>
